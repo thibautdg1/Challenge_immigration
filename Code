@@ -1,0 +1,272 @@
+import configparser
+import pandas as pd
+from datetime import datetime as dt
+import os
+import boto3
+from pyspark.sql import SparkSession
+from pyspark.sql.functions import udf, col, split
+from pyspark.sql.types import StructType as R, StructField as Fld, DoubleType as Dbl, StringType as Str, IntegerType as Int, DateType as Date, LongType as Long
+import shutil
+
+
+config = configparser.ConfigParser()
+config.read("dwh.cfg")
+
+os.environ["AWS_ACCESS_KEY_ID"] = config["AWS_ACCESS_KEY_ID"]
+os.environ["AWS_SECRET_ACCESS_KEY"] = config["AWS_SECRET_ACCESS_KEY"]
+
+
+def create_spark_session():
+    spark = SparkSession \
+        .builder \
+        .config("spark.jars.packages","saurfang:spark-sas7bdat:2.0.0-s_2.11")\
+        .enableHiveSupport()\
+        .getOrCreate()
+    return spark
+
+
+def process_immigration_data(spark, input_data, output_data, dimension, df_us_state, df_visa, df_mode):
+    """
+         Function to load the immigration-data file from the current machine to the output S3 bucket (in AWS) using the write paquet function.
+
+        There are tree params here : spark for the spark session instance, input_file and output_file for the input & output files paths.
+    """
+
+    # Read the sas_data folder with spark
+    df_spark = spark.read\
+                    .format("com.github.saurfang.sas.spark")\
+                    .load(input_data)
+   
+    # get datetime from arrdate column value
+    get_date = udf(lambda x: (dt.datetime(1960, 1, 1).date() + dt.timedelta(x)).isoformat() if x else None)
+    df_spark = df_spark.withColumn("arrdate", get_date(df_spark.arrdate))
+    
+    # To test with the immigration_data_sample file
+    #df_spark = spark.read\
+    #                .format("csv")\
+    #                .option("header", "true")\
+    #                .load("immigration_data_sample.csv")\
+    #                .drop("count") 
+    
+    print("df_spark", df_spark.count())
+
+    df_spark.createOrReplaceTempView("df_spark")
+    df_us_state.createOrReplaceTempView("df_us_state")
+    df_visa.createOrReplaceTempView("df_visa")
+    df_mode.createOrReplaceTempView("df_mode")   
+  
+    # If we count all the missing values of states, we get 99 missing values 
+    # We get the arrival mode and the visa type from the mappings
+    # Cleaning the df from immigration_data
+    df_immigration_clean = spark.sql("""SELECT i.i94yr as year,
+                                               i.i94mon as month,
+                                               i.i94cit as birth_country,
+                                               i.i94res as residence_country,
+                                               i.i94port as port,
+                                               i.arrdate as arrival_date,
+                                               coalesce(m.mode, "Not reported") as arrival_mode,
+                                               coalesce(c.state_code, "99") as us_state,
+                                               i.depdate as departure_date,
+                                               i.i94bir as repondent_age,
+                                               coalesce(v.visa, "Other") as visa_type_code,
+                                               i.dtadfile as date_added,
+                                               i.visapost as visa_issued_department,
+                                               i.occup as occupation,
+                                               i.entdepa as arrival_flag,
+                                               i.entdepd as departure_flag,
+                                               i.entdepu as update_flag,
+                                               i.matflag as match_flag,
+                                               i.biryear as birth_year,
+                                               i.dtaddto as allowed_date,
+                                               i.insnum as ins_number,
+                                               i.airline as airline,
+                                               i.admnum as admission_number,
+                                               i.fltno as flight_number,
+                                               i.visatype as visa_type
+                                         FROM  df_spark i  LEFT JOIN df_us_state c ON i.i94addr = c.state_code
+                                                           LEFT JOIN df_visa v ON i.i94visa = v.visa_code
+                                                           LEFT JOIN df_mode m on i.i94mode = m.mode_code
+                                        """)
+    
+    # Checking the data quality of this df
+    print("df_immigration_clean", df_immigration_clean.count())
+    print(df_immigration_clean.show(10, truncate = False))
+    df_immigration_clean.printSchema()
+    
+    # Writing data to parquet and partition them by year and month
+    dir_path = output_data + dimension
+    df_immigration_clean.write.mode("overwrite").partitionBy("year", "month", "us_state").parquet(dir_path + "_us_state")
+    df_immigration_clean.write.mode("overwrite").partitionBy("year", "month", "arrival_mode", "port").parquet(dir_path + "_arrival_mode")
+
+
+def process_mapping(spark, input_data, output_data, col_names, dimension, sep):
+    """
+        Function to process the mapping files from the current machine and make a cleaning.
+        There are six paramaters here: spark for the spark session instance, input_file and output_file for the input & output files paths, col_name for the name of used columns, dimension for the name of dimension and sep for the used separator.
+    """
+    dir_path = output_data + dimension
+    
+    df = pd.read_csv(input_data, sep = separator, header = None, engine = "python",  names = col_names, skipinitialspace = True) 
+    df.head()
+    
+    # Removing the single quotes in the column names of dataframe
+    df.iloc[: , 1] = df.iloc[: , 1].str.replace("'", "")
+    
+    # Replacing invalid codes with another more relevant value in each "dim_name"
+    if(dimension == 'country'):
+        df["country"] = df["country"].replace(to_replace = ["No Country.*", "INVALID.*", "Collapsed.*"], value = "Other", regex = True)
+
+    if(dimension == 'us_state'):
+        df.iloc[: , 0] = df.iloc[: , 0].str.replace("'", "").str.replace("\t", "")
+        
+    if(dimension == 'us_port'):
+        df.iloc[: , 0] = df.iloc[: , 0].str.replace("'", "")
+        # splitting city and state
+        new = df["city"].str.split(", ", n = 1, expand = True) 
+        # making separate state column
+        df["state"] = new[1].str.strip()
+        # replacing the value of city column
+        df["city"] = new[0] 
+    
+    # Converting the old dataframe to a spark dataframe
+    df_spark = spark.createDataFrame(df)
+    
+    # Checking the data quality
+    print(dimension, df_spark.count())
+    print(df_spark.show(10, truncate = False))
+    df_spark.printSchema()
+    
+    return df_spark
+
+def process_airport_codes(spark, input_data, output_data, dimension):
+    """
+        Function to load the airport-codes file from the current machine to the output S3 bucket (in AWS) using the write paquet function. 
+        There are four parameters here: spark for the spark session instance, input_file and output_file for the input & output files paths and dimension for the name of dimension.
+    """
+    airport_schema = R([Fld("airport_id", Str()),
+                        Fld("type", Str()),
+                        Fld("name", Str()),
+                        Fld("elevation_ft", Str()),
+                        Fld("continent", Str()),
+                        Fld("iso_country", Str()),
+                        Fld("iso_region", Str()),
+                        Fld("municipality", Str()),
+                        Fld("gps_code", Str()),
+                        Fld("iata_code", Str()),
+                        Fld("local_code", Str()),
+                        Fld("coordinates", Str())
+                      ])
+
+    df_airport = spark.read.csv(input_data, header = "true", schema = airport_schema).distinct()
+    print("df_airport", df_airport.count())
+    
+    # Cleaning the data of the dataframe df_airport    
+    df_airport = df_airport.filter("iso_country == 'US'")\
+                           .withColumn("state", split(col("iso_region"), "-")[1])\
+                           .withColumn("latitude", split(col("coordinates"), ",")[0].cast(Dbl()))\
+                           .withColumn("longitude", split(col("coordinates"), ",")[1].cast(Dbl()))\
+                           .drop("coordinates")\
+                           .drop("iso_region")\
+                           .drop("continent")
+    
+    df_airport.createOrReplaceTempView("df_airports") 
+    
+    df_airport_clean = spark.sql("""SELECT airport_id, type, name, elevation_ft, iso_country, state, municipality, gps_code, iata_code as airport_code, latitude, longitude
+                                    FROM df_airports
+                                    WHERE iata_code is NOT NULL
+                                UNION
+                                SELECT airport_id, type, name, elevation_ft, iso_country, state, municipality, gps_code, local_code  as airport_code, latitude, longitude
+                                    FROM df_airports
+                                    WHERE local_code is NOT NULL
+                                """)
+    
+    print("df_airport_clean", df_airport_clean.count())
+    print(df_airport_clean.show(10, truncate = False)) 
+    df_airport_clean.printSchema()
+    
+    dir_path = output_data + dimension
+    df_airport_clean.repartitionByRange(3, "airport_code", "state").write.mode("overwrite").parquet(dir_path)
+
+    
+def process_us_cities_demographics(spark, input_data, output_data, dimension):
+    """
+        Function to load the US cities demographics file from the current machine to the output S3 bucket (in AWS) using the write paquet function.
+        There are four parameters here: spark for the spark session instance, input_file and output_file for the input & output files paths and dimension for the name of dimension.
+    """   
+    us_cities_schema = R([Fld("city", Str()),
+                          Fld("state", Str()),
+                          Fld("median_age", Dbl()),
+                          Fld("male_population", Str()),
+                          Fld("female_population", Str()),
+                          Fld("total_population", Int()),
+                          Fld("number_veterans", Int()),
+                          Fld("number_foreign_born", Int()),
+                          Fld("average_household_size", Dbl()),
+                          Fld("state_code", Str()),
+                          Fld("race", Str()),
+                          Fld("count", Int()) 
+                        ])
+    
+    df_us_cities = spark.read.csv(input_data, header = "true", sep = ";", schema = us_cities_schema)
+    print("df_us_cities", df_us_cities.count())
+    
+    # Cleaning data from the us-cities-demographics dataframe
+    df_us_cities_clean = df_us_cities.filter(df_us_cities.state.isNotNull())\
+                                     .dropDuplicates(subset = ["state", "city", "race"])
+    
+    # Checking the data quality of this dataframe
+    print("df_us_cities_clean", df_us_cities_clean.count())
+    print(df_us_cities_clean.show(10, truncate = False))
+    df_us_cities_clean.printSchema()
+    
+    dir_path = output_data + dimension
+    df_us_cities_clean.write.mode("overwrite").partitionBy("state").parquet(dir_path)
+
+# Uploading files to s3 with python by keeping the original folder structure
+def upload_files(s3, S3_BUCKET, s3_path):
+    for subdirs, dirs, files in os.walk(s3_path):
+        for file in files:
+            full_path = os.path.join(subdirs, file)
+            with open(full_path, 'rb') as data:
+                S3_BUCKET.put_object(key = full_path[len(path)+1:], body = data)
+
+                
+def main():
+    spark = create_spark_session()
+        
+    input_data = ""
+    output_data = "2016_04/"
+
+    KEY                    = config.get('AWS','AWS_ACCESS_KEY_ID')
+    SECRET                 = config.get('AWS','AWS_SECRET_ACCESS_KEY')
+    S3_BUCKET              = config.get('AWS','S3')
+
+    session = boto3.Session(
+        aws_access_key_id = KEY,
+        aws_secret_access_key = SECRET,
+        region_name = "us-west-2")
+    
+    s3 = session.resource("s3")
+    bucket = s3.Bucket(S3_BUCKET)
+
+    
+    df_country = process_mapping(spark, "Mapping/i94cntyl.txt", output_data, ["country_code", "country"], "country", " =  ")
+    df_us_state = process_mapping(spark, "Mapping/i94addrl.txt", output_data, ["state_code", "state"], "us_state", "=")
+    df_us_port = process_mapping(spark, "Mapping/i94prtl.txt", output_data, ["port_code", "city"], "us_port", "	=	")
+    df_visa = process_mapping(spark, "Mapping/i94visa.txt", output_data, ["visa_code", "visa"], "visa", " = ")
+    df_mode = process_mapping(spark, "Mapping/i94model.txt", output_data, ["mode_code", "mode"], "mode", " = ")
+    
+    df_country.write.mode("overwrite").parquet(output_data + "countries")
+    df_us_state.write.mode("overwrite").parquet(output_data + "us_states")
+    df_us_port.write.mode("overwrite").parquet(output_data + "us_ports")
+    
+    process_airports(spark, "airport-codes_csv.csv", output_data, "us_airports")       
+    process_us_cities_demographics(spark, "us-cities-demographics.csv", output_data, "us_cities_demographics") 
+    process_immigration_data(spark, "../../data/18-83510-I94-Data-2016/i94_apr16_sub.sas7bdat", output_data, "immigration_data", df_us_state, df_visa, df_mode)
+    
+    # Uploading files to S3
+    upload_files(s3, bucket, "./US_immigration/2016_04")      
+    
+
+if __name__ == "__main__":
+    main()
